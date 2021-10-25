@@ -1,0 +1,523 @@
+#include<iostream>
+#include<cmath>
+#include<random>
+#include<chrono>
+#include<fstream>
+#include<sstream>
+#include<Accelerate/Accelerate.h>
+
+#define FEATURE (47236)
+#define SAMPLE (20000)
+#define ELEMMAX (2000000)
+#define LOOP_MAX (1000000000)
+#define XBETA_REFRESH_INTERVAL (40)
+#define DSASVI_SAFETY_EPS (0.0000001)
+using namespace std;
+
+
+double Xcsc_elem[ELEMMAX];
+long long Xcsc_rowind[ELEMMAX];
+int Xcsc_colpos[FEATURE + 1];
+
+inline double dot_xj(int j, const double* v){
+    return sparse_inner_product_dense_double( *(Xcsc_colpos + j + 1) - *(Xcsc_colpos + j), Xcsc_elem + *(Xcsc_colpos + j), Xcsc_rowind + *(Xcsc_colpos + j), v, 1);
+}
+
+inline double norm_xj(int j){
+    return sparse_vector_norm_double( *(Xcsc_colpos + j + 1) - *(Xcsc_colpos + j), Xcsc_elem + *(Xcsc_colpos + j), Xcsc_rowind + *(Xcsc_colpos + j), SPARSE_NORM_TWO);
+}
+
+inline void update_beta(int j, double delta, double* beta, double* Xbeta){
+    *(beta + j) += delta;
+    sparse_vector_add_with_scale_dense_double( *(Xcsc_colpos + j + 1) - *(Xcsc_colpos + j), delta, Xcsc_elem + *(Xcsc_colpos + j), Xcsc_rowind + *(Xcsc_colpos + j), Xbeta, 1);
+}
+
+inline void get_Xbeta(const double* beta, double* Xbeta){
+    for(int i = 0; i < SAMPLE; i++){
+        *(Xbeta + i) = 0.0;
+    }
+    for(int j = 0; j < FEATURE; j++){
+        if(*(beta + j) != 0.0){
+            sparse_vector_add_with_scale_dense_double( *(Xcsc_colpos + j + 1) - *(Xcsc_colpos + j), *(beta + j), Xcsc_elem + *(Xcsc_colpos + j), Xcsc_rowind + *(Xcsc_colpos + j), Xbeta, 1);
+        }
+    }
+    return;
+}
+
+inline bool exists_sphere_twohalfspace(const double rsq, const double a, const double b, const double vTv, const double wTw, const double vTw){
+    // candidate of argmin min_{||t||}_2^2 under t^Tv >= a and t^Tw >= b
+    // = 0, a/v^Tv*v, b/w^Tw*w, (v w) ((v w)^T(v w))^(-1) (a b)^T
+
+    return ( (a <= 0 && b <= 0) || (0 < vTv && a*a/vTv <= rsq && b <= a/vTv*vTw) || (0 < wTw && b*b/wTw <= rsq && a <= b/wTw*vTw) || (0 < (vTv*wTw-vTw*vTw) && (a*a*wTw+b*b*vTv-2.0*a*b*vTw)/(vTv*wTw-vTw*vTw) <= rsq) );
+}
+
+inline double linf_for_sqloss_residual(const int d, const bool* eliminated, const double* XTXbeta, const double* XTy){
+    // return {|X^T(Xbeta-y)|}_inf
+    double r = 0.0;
+    for(int j = 0; j < d; j++){
+        if(!*(eliminated + j)) { r = max(r, abs(*(XTXbeta + j) - *(XTy + j))); }
+    }
+    return r;
+}
+
+inline void screening_dsasvi_lasso_lincombtheta(const int d, bool* eliminated, const double* XTXbeta, const double* XTy, const double* l2s, const double l1beta, const double l2Xbeta, const double l2y, const double yTXbeta, const double coef_Xbeta, const double coef_y){
+    // theta = coef_Xbeta * Xbeta + coef_y * y
+
+    // exists or not z which    {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and z^T(-Xbeta) <= g(beta) and z^T(-x_j) >= 1
+    // = exists or not z which    {||z||}_2^2 <= {||(theta+y)/2||}_2^2 and z^TXbeta >= -g(beta) - ((theta-y)/2)^TXbeta and z^T(-x_j) >= 1 + ((theta-y)/2)^Tx_j
+
+    double rsq = (coef_Xbeta * coef_Xbeta * l2Xbeta * l2Xbeta + (coef_y+1.0) * (coef_y+1.0) * l2y * l2y + 2.0 * coef_Xbeta * (coef_y+1.0) * yTXbeta)/4.0;
+    double oTXbeta = (coef_Xbeta  * l2Xbeta * l2Xbeta + (coef_y-1.0) * yTXbeta)/2.0;
+    for(int j = 0; j < d; j++){
+        if(*(eliminated + j)) { continue; }
+        double oTxj = (coef_Xbeta * *(XTXbeta + j) + (coef_y-1) * *(XTy + j))/2.0;
+        *(eliminated + j)
+            = !exists_sphere_twohalfspace(rsq, -l1beta - oTXbeta - DSASVI_SAFETY_EPS * l2Xbeta, 1.0 + oTxj - DSASVI_SAFETY_EPS * *(l2s + j), l2Xbeta * l2Xbeta, *(l2s + j) * *(l2s + j), - *(XTXbeta + j))
+            && !exists_sphere_twohalfspace(rsq, -l1beta - oTXbeta - DSASVI_SAFETY_EPS * l2Xbeta, 1.0 - oTxj - DSASVI_SAFETY_EPS * *(l2s + j), l2Xbeta * l2Xbeta, *(l2s + j) * *(l2s + j), *(XTXbeta + j));
+    }
+}
+
+inline void screening_gapdome_lasso_lincombtheta(const int d, bool* eliminated, const double* XTXbeta, const double* XTy, const double* l2s, const double l1beta, const double l2Xbeta, const double l2y, const double yTXbeta, const double coef_Xbeta, const double coef_y){
+    // theta = coef_Xbeta * Xbeta + coef_y * y
+
+    // {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and -1/2*{||z+y||}_2^2 + 1/2*{||y||}_2^2 <= 1/2*{||Xbeta-y||}_2^2 + g(beta)
+    // to {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and -1/2*{||z+y||}_2^2 + 1/2*{||z-(theta-y)/2||}_2^2 - 1/2*{||(theta+y)/2||}_2^2 <= 1/2*{||Xbeta-y||}_2^2 + g(beta) - 1/2*{||y||}_2^2
+    // = {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and (z-theta)^T((-y)-theta) <= {||theta+y||}_2^2 + ({||Xbeta-y||}_2^2 + 2g(beta) - {||y||}_2^2)
+
+
+    // exists or not z which {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and (z-theta)^T((-y)-theta) <= {||theta+y||}_2^2 + ({||Xbeta-y||}_2^2 + 2g(beta) - {||y||}_2^2) and z^T(-x_j) >= 1
+    // = exists or not z which {||z||}_2^2 <= {||(theta+y)/2||}_2^2 and z^T(theta+y) >= -1/2*{||theta+y||}_2^2 - beta^TX^TXbeta + 2y^TXbeta - 2g(beta) and z^T(-x_j) >= 1+x_j^T(theta-y)/2
+
+    double vTv = coef_Xbeta * coef_Xbeta * l2Xbeta * l2Xbeta + (coef_y+1) * (coef_y+1) * l2y * l2y + 2.0 * coef_Xbeta * (coef_y+1) * yTXbeta;
+    double rsq = vTv/4.0;
+    double a = -0.5*vTv - l2Xbeta * l2Xbeta + 2.0*yTXbeta - 2.0*l1beta;
+    for(int j = 0; j < d; j++){
+        if(*(eliminated + j)) { continue; }
+        double oTxj = (coef_Xbeta * *(XTXbeta + j) + (coef_y-1) * *(XTy + j))/2.0;
+        double vTxj = coef_Xbeta * *(XTXbeta + j) + (coef_y+1) * *(XTy + j);
+        *(eliminated + j)
+            = !exists_sphere_twohalfspace(rsq, a, 1.0 + oTxj, vTv, *(l2s + j) * *(l2s + j), -vTxj)
+            && !exists_sphere_twohalfspace(rsq, a, 1.0 - oTxj, vTv, *(l2s + j) * *(l2s + j), vTxj);
+    }
+}
+
+inline void screening_gapsphere_lasso_lincombtheta(const int d, bool* eliminated, const double* XTXbeta, const double* XTy, const double* l2s, const double l1beta, const double l2Xbeta, const double l2y, const double yTXbeta, const double coef_Xbeta, const double coef_y){
+    // theta = coef_Xbeta * Xbeta + coef_y * y
+
+    // {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and -1/2*{||z+y||}_2^2 + 1/2*{||y||}_2^2 <= 1/2*{||Xbeta-y||}_2^2 + g(beta)
+    // to 1/2*{||z-theta||}_2^2 <= 1/2*{||(theta+y)||}_2^2 - 1/2*y^Ty + 1/2*{||Xbeta-y||}_2^2 + g(beta)
+
+
+    // exists or not z which z^T(-x_j) >= 1 and 1/2*{||z-theta||}_2^2 <= 1/2*{||(theta+y)||}_2^2 - 1/2*y^Ty + 1/2*{||Xbeta-y||}_2^2 + g(beta)
+    // = (sqrt(2*(1/2*{||(theta+y)||}_2^2 - 1/2*y^Ty + 1/2*{||Xbeta-y||}_2^2 + g(beta))){||x_j||}_2 >= 1 + theta^Tx_j)
+
+    double primal_value = (l2Xbeta * l2Xbeta - 2.0*yTXbeta + l2y * l2y)/2.0 + l1beta;
+    double dual_value = l2y*l2y/2.0 - (coef_Xbeta * coef_Xbeta * l2Xbeta * l2Xbeta + (coef_y+1) * (coef_y+1) * l2y * l2y + 2.0 * coef_Xbeta * (coef_y+1) * yTXbeta)/2.0;
+
+    for(int j = 0; j < d; j++){
+        if(*(eliminated + j)) { continue; }
+        double thetaTxj = coef_Xbeta * *(XTXbeta + j) + coef_y * *(XTy + j);
+        *(eliminated + j)
+            = !( 0 >= 1.0 + thetaTxj || 2.0 * (primal_value - dual_value) * *(l2s + j) * *(l2s + j) >= (1.0 + thetaTxj) * (1.0 + thetaTxj) )
+            && !( 0 >= 1.0 - thetaTxj || 2.0 * (primal_value - dual_value) * *(l2s + j) * *(l2s + j) >= (1.0 - thetaTxj) * (1.0 - thetaTxj) );
+    }
+}
+
+inline void screening_dedpp_lasso_lincombtheta(const int d, bool* eliminated, const double* XTXbeta, const double* XTy, const double* l2s, const double l1beta, const double l2Xbeta, const double l2y, const double yTXbeta, const double coef_Xbeta, const double coef_y){
+    // theta = coef_Xbeta * Xbeta + coef_y * y
+
+    // {||z-(theta-y)/2||}_2^2 <= {||(theta+y)/2||}_2^2 and z^T(-Xbeta) <= g(beta)
+    // = forall k >= 0   {||z||}^2 - z^T(theta-y) - kz^TXbeta <= y^Ttheta + kg(beta)
+    // = forall k >= 0   {||z-(theta-y+kXbeta)/2||}^2 <= {||(theta+y)/2||}_2^2 + k(g(beta)+((theta-y)/2)^TXbeta) + k^2{||Xbeta||}^2/4
+    // to {||z-(theta-y+kXbeta)/2||}^2 <= {||(theta+y)/2||}_2^2 + k(g(beta)+((theta-y)/2)^TXbeta) + k^2{||Xbeta||}^2/4    where   k = max(0, -2(g(beta)+((theta-y)/2)^TXbeta)/{||Xbeta||}^2)
+
+    double tmpoTXbeta = (coef_Xbeta * l2Xbeta * l2Xbeta + (coef_y - 1.0) * yTXbeta) / 2.0;
+    double k = (l2Xbeta <= 0 || 0 <= (l1beta + tmpoTXbeta)) ? 0.0 : (-2.0 * (l1beta + tmpoTXbeta) / l2Xbeta / l2Xbeta);
+    double rsq = (coef_Xbeta * coef_Xbeta * l2Xbeta * l2Xbeta + (coef_y + 1.0) * (coef_y + 1.0) * l2y * l2y + 2.0 * coef_Xbeta * (coef_y + 1.0) * yTXbeta) / 4.0 + k * l1beta + k * tmpoTXbeta + k * k * l2Xbeta * l2Xbeta / 4.0;
+    for(int j = 0; j < d; j++){
+        if(*(eliminated + j)) { continue; }
+        double oTxj = ((coef_Xbeta + k) * *(XTXbeta + j) + (coef_y-1) * *(XTy + j)) / 2.0;
+        *(eliminated + j)
+            = !( 0 >= 1.0 + oTxj || rsq * *(l2s + j) * *(l2s + j) >= (1.0 + oTxj) * (1.0 + oTxj) )
+            && !( 0 >= 1.0 - oTxj || rsq * *(l2s + j) * *(l2s + j) >= (1.0 - oTxj) * (1.0 - oTxj) );
+    }
+}
+
+
+
+void optimizer_lasso_cd(const double* y, const int screening_id, const double gap_eps, const int dual_check_interval, const double* l2s, const double* XTy, double* beta){
+    // min_{beta in R^d} 1/2*{||X beta - y||}_2^2 + {||beta||}_1
+    // = max_{theta in R^n | -1 <= X^T theta <= 1} -1/2*{||theta - (-y)||}_2^2 + 1/2*{||y||}_2^2
+    // theta^* = X beta^* - y   -1 < x_j^T theta^* < 1 implies beta^*_j = 0
+
+
+    bool eliminated[FEATURE];
+    double Xbeta[SAMPLE];
+    double XTXbeta[FEATURE];
+    for(int j = 0; j < FEATURE; j++){
+        *(eliminated + j) = false;
+    }
+
+    double l2y = sqrt(cblas_ddot(SAMPLE, y, 1, y, 1));
+
+    for(int loop_counter = 0; loop_counter < LOOP_MAX; loop_counter++){
+
+        if(loop_counter%XBETA_REFRESH_INTERVAL == 0){
+            get_Xbeta(beta, Xbeta);    // O(np)  p : number of beta's non-zero elements
+        }
+
+        if(loop_counter%dual_check_interval == 0){
+
+            double l2Xbeta = sqrt(cblas_ddot(SAMPLE, Xbeta, 1, Xbeta, 1));
+            double yTXbeta = cblas_ddot(SAMPLE, Xbeta, 1, y, 1);
+            double l1beta = cblas_dasum(FEATURE, beta, 1);
+            for(int j = 0; j < FEATURE; j++){
+                if(*(eliminated + j)){
+                    *(XTXbeta + j) = 0.0/0.0;
+                }
+                else{
+                    *(XTXbeta + j) = dot_xj(j, Xbeta);    // O(n)
+                }
+            }
+
+            double k = 1.0/linf_for_sqloss_residual(FEATURE, eliminated, XTXbeta, XTy);  // theta = k(Xbeta-y)
+            double primal_value = (l2Xbeta*l2Xbeta + l2y*l2y - 2.0*yTXbeta)/2.0 + l1beta;
+            double dual_value = -(k*k*l2Xbeta*l2Xbeta + (1-k)*(1-k)*l2y*l2y + 2.0*k*(1-k)*yTXbeta)/2.0 + l2y*l2y/2.0;
+            if(primal_value - dual_value < gap_eps*l2y*l2y/2.0){
+                return;
+            }
+
+            if(screening_id == 1){
+                screening_dsasvi_lasso_lincombtheta(FEATURE, eliminated, XTXbeta, XTy, l2s, l1beta, l2Xbeta, l2y, yTXbeta, k, -k);
+            }
+            if(screening_id == 2){
+                screening_dedpp_lasso_lincombtheta(FEATURE, eliminated, XTXbeta, XTy, l2s, l1beta, l2Xbeta, l2y, yTXbeta, k, -k);
+            }
+            if(screening_id == 3){
+                screening_gapdome_lasso_lincombtheta(FEATURE, eliminated, XTXbeta, XTy, l2s, l1beta, l2Xbeta, l2y, yTXbeta, k, -k);
+            }
+            if(screening_id == 4){
+                screening_gapsphere_lasso_lincombtheta(FEATURE, eliminated, XTXbeta, XTy, l2s, l1beta, l2Xbeta, l2y, yTXbeta, k, -k);
+            }
+
+            for(int j = 0; j < FEATURE; j++){
+                if(*(eliminated + j) && (*(beta + j) != 0.0)){
+                    update_beta(j, - *(beta + j), beta, Xbeta);    // O(n)
+                }
+            }
+        }
+
+        for(int j = 0; j < FEATURE; j++){
+            if(*(eliminated + j)) { continue; }
+            //  argmin_k 1/2*{||X(beta+ke_j) - y||}_2^2 + {||beta+ke_j||}_1
+            //= argmin_k k^2/2*{||x_j||}_2^2 + k*x_j^T(Xbeta - y) + |beta_j+k|
+
+            double xjTXbeta = dot_xj(j, Xbeta);    // O(n)
+
+            double grad_at0 = - *(beta + j) * *(l2s + j) * *(l2s + j) + xjTXbeta - *(XTy + j);
+            if(grad_at0 < -1){
+                double delta = (*(XTy + j) - xjTXbeta - 1.0)/(*(l2s + j) * *(l2s + j));
+                update_beta(j, delta, beta, Xbeta);    // O(n)
+            }
+            else if(grad_at0 > 1){
+                double delta = (*(XTy + j) - xjTXbeta + 1.0)/(*(l2s + j) * *(l2s + j));
+                update_beta(j, delta, beta, Xbeta);    // O(n)
+            }
+            else if(*(beta + j) != 0){
+                update_beta(j, - *(beta + j), beta, Xbeta);    // O(n)
+            }
+        }
+    }
+
+    cout << "loop count over" << endl;
+}
+
+inline void seq_optimizer_lasso_cd(const double* yraw, const int lambda_num, const double* lambdas, const int screening_id, const double gap_eps, const int dual_check_interval){
+
+    double beta[FEATURE];
+    double l2s[FEATURE];
+    double XTy[FEATURE];
+    double y[SAMPLE];
+    double Xbeta_tmp[SAMPLE];
+    for(int j = 0; j < FEATURE; j++){
+        *(beta + j) = 0.0;
+    }
+    for(int j = 0; j < FEATURE; j++){
+        *(l2s + j) = norm_xj(j);
+    }
+
+    for(int lambda_id = 0; lambda_id < lambda_num; lambda_id++){
+        for(int i = 0; i < SAMPLE; i++){
+            *(y + i) = 0.0;
+        }
+        cblas_daxpy(SAMPLE, 1.0 / *(lambdas + lambda_id), yraw, 1, y, 1);
+        for(int j = 0; j < FEATURE; j++){
+            *(XTy + j) = dot_xj(j, y);
+        }
+
+        // argmin_{k>=0} 1/2*{||kXbeta-y||}_2^2+k{||beta||}_1
+        // = max(0, -({||beta||}_1-yTXbeta)/{||Xbeta||}_2^2)
+        get_Xbeta(beta, Xbeta_tmp);
+        double l1beta = cblas_dasum(FEATURE, beta, 1);
+        double yTXbeta = cblas_ddot(SAMPLE, y, 1, Xbeta_tmp, 1);
+        double betaTXTXbeta = cblas_ddot(SAMPLE, Xbeta_tmp, 1, Xbeta_tmp, 1);
+        if(0 < betaTXTXbeta){
+            double k = -min(0.0, l1beta - yTXbeta)/betaTXTXbeta;
+            for(int j = 0; j < FEATURE; j++){
+                *(beta + j) *= k;
+            }
+        }
+
+        optimizer_lasso_cd(y, screening_id, gap_eps, dual_check_interval, l2s, XTy, beta);
+    }
+}
+
+
+
+void load_rowsorted_coordinatemm_csr(const string path, const int nrow_read, const int ncol_expected, const int nelem_max, double* elements, long long* column_indices, int* row_positions){
+    ifstream ifst;
+    ifst.open(path, ios::in);
+
+    string linestring;
+    string tmpstring;
+
+    bool readok;
+    for(int i = 0; i < 100; i++){
+        readok = getline(ifst, linestring, '\n');
+        if(!readok) { return; }
+        if(linestring[0] != '%') { break; }
+        if(i == 99) { return; }
+    }
+
+    stringstream shapestream;
+    shapestream << linestring;
+    readok = getline(shapestream, tmpstring, ' ');
+    int nrow_data = stoi(tmpstring);
+    readok = getline(shapestream, tmpstring, ' ');
+    int ncol = stoi(tmpstring);
+    readok = getline(shapestream, tmpstring, ' ');
+    int nelem_data = stoi(tmpstring);
+    if(!readok || nrow_data < nrow_read || ncol != ncol_expected) { return; }
+
+    int row_index = -1;
+    int k = 0;
+    for(; k < nelem_max && k < nelem_data; k++){
+        stringstream elemstream;
+        readok = getline(ifst, linestring);
+        if(!readok) { cout << "!readok:" << k << endl; return; }
+        elemstream << linestring;
+        readok = getline(elemstream, tmpstring, ' ');
+        int r = stoi(tmpstring) - 1;
+        if(r < row_index) { cout << "illegal order :" << k << endl; return; }
+        if(nrow_read <= r){
+            for(; row_index < nrow_read; row_index++){
+                *(row_positions + row_index + 1) = k;
+            }
+            return;
+        }
+        for(; row_index < r; row_index++){
+            *(row_positions + row_index + 1) = k;
+        }
+        readok = getline(elemstream, tmpstring, ' ');
+        *(column_indices + k) = stoi(tmpstring) - 1;
+        readok = getline(elemstream, tmpstring, ' ');
+        *(elements + k) = stof(tmpstring);
+        if(!readok) { cout << "!readok:" << k << endl; return; }
+    }
+    if(k != nelem_data){
+        cout << "illegal end" << endl;
+    }
+}
+
+void loadcol_rowsorted_coordinatemm(const string path, const int nrow_read, const int ncol_expected, const int colid, double* out_col){
+
+    for(int k = 0; k < nrow_read; k++){
+        *(out_col + k) = 0.0;
+    }
+
+    ifstream ifst;
+    ifst.open(path, ios::in);
+
+    string linestring;
+    string tmpstring;
+
+    bool readok;
+    for(int i = 0; i < 100; i++){
+        readok = getline(ifst, linestring, '\n');
+        if(!readok) { return; }
+        if(linestring[0] != '%') { break; }
+        if(i == 99) { return; }
+    }
+
+    stringstream shapestream;
+    shapestream << linestring;
+    readok = getline(shapestream, tmpstring, ' ');
+    int nrow_data = stoi(tmpstring);
+    readok = getline(shapestream, tmpstring, ' ');
+    int ncol = stoi(tmpstring);
+    readok = getline(shapestream, tmpstring, ' ');
+    int nelem_data = stoi(tmpstring);
+    if(!readok || nrow_data < nrow_read || ncol != ncol_expected) { return; }
+
+    int k = 0;
+    for(int k = 0; k < nelem_data; k++){
+        stringstream elemstream;
+        readok = getline(ifst, linestring);
+        if(!readok) { cout << "!readok:" << k << endl; return; }
+        elemstream << linestring;
+        readok = getline(elemstream, tmpstring, ' ');
+        int r = stoi(tmpstring) - 1;
+        if(nrow_read <= r){
+            return;
+        }
+        readok = getline(elemstream, tmpstring, ' ');
+        if(colid == stoi(tmpstring) - 1){
+            readok = getline(elemstream, tmpstring, ' ');
+            *(out_col + r) = stof(tmpstring);
+        }
+        if(!readok) { cout << "!readok:" << k << endl; return; }
+    }
+}
+
+void sortedcsr_to_csc(const int nrow, const int ncol, const double* Xin_elem, const long long* Xin_colind, const int* Xin_rowpos, double* Xout_elem, long long* Xout_rowind, int* Xout_colpos){
+    int* reading_positions = new int[nrow];
+    for(int rowind = 0; rowind < nrow; rowind++){
+        reading_positions[rowind] = Xin_rowpos[rowind];
+    }
+
+    int writing_position = 0;
+    for(int colind = 0; colind < ncol; colind++){
+        Xout_colpos[colind] = writing_position;
+        for(int rowind = 0; rowind < nrow; rowind++){
+            if(reading_positions[rowind] < Xin_rowpos[rowind+1] && Xin_colind[reading_positions[rowind]] == colind){
+                Xout_elem[writing_position] = Xin_elem[reading_positions[rowind]];
+                Xout_rowind[writing_position] = rowind;
+                reading_positions[rowind]++;
+                writing_position++;
+            }
+        }
+    }
+    if(writing_position != Xin_rowpos[nrow]){
+        cout << "writing_position:" << writing_position << ",Xin_rowpos[nrow]:" << Xin_rowpos[nrow];
+    }
+    Xout_colpos[ncol] = writing_position;
+
+    delete[] reading_positions;
+}
+
+void shuffle_indices(const int n, int* result){
+    random_device seed_gen;
+    mt19937 engine(seed_gen());
+    uniform_int_distribution<> colindgen(0, n-1);
+
+    for(int i = 0; i < n; i++){
+        *(result + i) = i;
+    }
+    for(int i = 0; i < n; i++){
+        int j = colindgen(engine);
+        int tmp = *(result + i);
+        *(result + i) = *(result + j);
+        *(result + j) = tmp;
+    }
+    
+}
+
+void subcol_denserowlist(const int nrow, const int nincol, const int noutcol, const double* Xinput, double* Xoutput, const int* indices){
+    for(int i = 0; i < nrow; i++){
+        for(int j = 0; j < nincol; j++){
+            if(*(indices + j) < noutcol){
+                *(Xoutput + noutcol*i + *(indices + j)) = *(Xinput + nincol*i + j);
+            }
+        }
+    }
+}
+
+void subcol_csr_unsortedinrow(const int nrow, const int nincol, const int noutcol, const double* Xinput_elem, const long long* Xinput_colind, const int* Xinput_rowpos, double* Xoutput_elem, long long* Xoutput_colind, int* Xoutput_rowpos, const int Xoutput_maxelem, const int* indices){
+    int outpos = 0;
+    int rowind = 0;
+    for(int rowind = 0; rowind < nrow; rowind ++){
+        *(Xoutput_rowpos + rowind) = outpos;
+        for(int inpos = *(Xinput_rowpos + rowind); inpos < *(Xinput_rowpos + rowind + 1); inpos++){
+            int outcolind = *(indices + *(Xinput_colind + inpos));
+            if(outcolind < noutcol){
+                *(Xoutput_elem + outpos) = *(Xinput_elem + inpos);
+                *(Xoutput_colind + outpos) = outcolind;
+                outpos++;
+            }
+            if(Xoutput_maxelem <= outpos){
+                return;
+            }
+        }
+    }
+    *(Xoutput_rowpos + nrow) = outpos;
+}
+
+
+int main(int argn, char** args){
+
+
+    //RCV1   FEATURE=47236
+    const int data_sample = 23149;
+    double* Xrawcsr_elem = new double[ELEMMAX];
+    long long* Xrawcsr_colind = new long long[ELEMMAX];
+    int Xrawcsr_rowpos[data_sample + 1];
+    load_rowsorted_coordinatemm_csr("rcv1_data.mtx", data_sample, FEATURE, ELEMMAX, Xrawcsr_elem, Xrawcsr_colind, Xrawcsr_rowpos);
+
+    double* Xrawcsc_elem = new double[ELEMMAX];
+    long long* Xrawcsc_rowind = new long long[ELEMMAX];
+    int Xrawcsc_colpos[FEATURE + 1];
+    sortedcsr_to_csc(data_sample, FEATURE, Xrawcsr_elem, Xrawcsr_colind, Xrawcsr_rowpos, Xrawcsc_elem, Xrawcsc_rowind, Xrawcsc_colpos);
+    delete[] Xrawcsr_elem;
+    delete[] Xrawcsr_colind;
+    cout << "elem:" << Xrawcsc_colpos[FEATURE] << endl;
+
+    double yraw[data_sample];
+    loadcol_rowsorted_coordinatemm("rcv1_target.mtx", data_sample, 103, 1, yraw);
+    for(int k = 0; k < data_sample; k++){
+        yraw[k] = yraw[k]*2.0 - 1.0;
+    }
+
+
+
+    int shuffled_indices[data_sample];
+    double ysubsampled[SAMPLE];
+
+
+    // Lasso Path
+    const int lambda_num = 100;
+    double lambdas[lambda_num];
+    double ratio = pow(100.0, 1.0/(double)(lambda_num-1));
+
+    double eps = pow(10.0, -4);
+
+    for(int counter = 0; counter < 50; counter++){
+
+        shuffle_indices(data_sample, shuffled_indices);
+        subcol_csr_unsortedinrow(FEATURE, data_sample, SAMPLE, Xrawcsc_elem, Xrawcsc_rowind, Xrawcsc_colpos, Xcsc_elem, Xcsc_rowind, Xcsc_colpos, ELEMMAX, shuffled_indices);
+        subcol_denserowlist(1, data_sample, SAMPLE, yraw, ysubsampled, shuffled_indices);
+
+
+        *(lambdas + 0) = 0.0;
+        for(int j = 0; j < FEATURE; j++){
+            *(lambdas + 0) = max(*(lambdas + 0), abs(dot_xj(j, ysubsampled)));
+        }
+        for(int lambda_id = 1; lambda_id < lambda_num; lambda_id++){
+            *(lambdas + lambda_id) = *(lambdas + lambda_id - 1) / ratio;
+        }
+
+
+        for(int screening_id = 0; screening_id < 5; screening_id++){
+            chrono::system_clock::time_point start = chrono::system_clock::now();
+            seq_optimizer_lasso_cd(ysubsampled, lambda_num, lambdas, screening_id, eps, 10);
+            chrono::system_clock::time_point end = chrono::system_clock::now();
+            cout << chrono::duration_cast<chrono::milliseconds>(end - start).count() << ",";
+        }
+        cout << endl;
+
+    }
+
+    delete[] Xrawcsc_elem;
+    delete[] Xrawcsc_rowind;
+
+    return 0;
+}
